@@ -14,8 +14,8 @@ struct NotesView: View {
     @FocusState private var inputFocused: Bool
 
     private var notes: [Note] {
-        guard let filter else { return meeting.notes }
-        return meeting.notes.filter { $0.categoryID == filter }
+        guard let filter else { return meeting.sortedNotes }
+        return meeting.sortedNotes.filter { $0.categoryID == filter }
     }
 
     var body: some View {
@@ -40,8 +40,15 @@ struct NotesView: View {
                         }
                         .padding(10)
                     }
-                    .onChange(of: meeting.notes.count) {
-                        if let last = notes.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    .onChange(of: meeting.notes.count) { old, new in
+                        // Notes are in meeting order, so a new one can land anywhere: show it.
+                        guard new > old, let added = meeting.notes.max(by: { $0.createdAt < $1.createdAt }) else { return }
+                        proxy.scrollTo(added.id, anchor: .center)
+                    }
+                    .onChange(of: app.notesScrollRequest) {
+                        // The current position moved in the transcript or the player: show its notes.
+                        guard let note = notes.first(where: { app.isHighlighted($0, in: meeting) }) else { return }
+                        withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(note.id, anchor: .center) }
                     }
                 }
             }
@@ -244,7 +251,7 @@ private struct NoteRow: View {
     let quote: String?
 
     private var meetingID: UUID { meeting.id }
-    private var isSelected: Bool { app.selectedNoteID == note.id }
+    private var isSelected: Bool { app.isHighlighted(note, in: meeting) }
 
     @State private var hovering = false
     @State private var editing = false
@@ -291,7 +298,20 @@ private struct NoteRow: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    if app.relinkingNoteID == note.id {
+                        Text("発言を選択中…")
+                            .font(.caption)
+                            .foregroundStyle(Color.accentColor)
+                    }
                     if hovering && !editing {
+                        Button {
+                            app.startRelinking(note)
+                        } label: {
+                            Image(systemName: "link")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                        .help("紐づける発言を変更(押したあと、文字起こしの行をクリック)")
                         Button(action: startEditing) {
                             Image(systemName: "pencil")
                         }
@@ -370,9 +390,12 @@ private struct NoteRow: View {
         .contentShape(Rectangle())
         // A single tap only: waiting to rule out a double click made selecting feel sluggish.
         .onTapGesture { app.select(note, in: meeting) }
-        .help(meeting.segment(for: note) != nil ? "クリックで文字起こしの該当箇所へ移動" : "")
+        .help(meeting.segment(for: note) != nil ? "クリックで文字起こしと再生位置を該当箇所へ移動" : "")
         .contextMenu {
             Button("編集", action: startEditing)
+            Button("紐づける発言を変更…") { app.startRelinking(note) }
+            Button("発言との紐づけを解除") { app.unlink(note, in: meeting) }
+                .disabled(note.segmentID == nil && note.time == nil)
             Button("クリップボードの画像を貼り付け") {
                 attach(NoteImages.importPasteboard(meetingID: meetingID))
             }

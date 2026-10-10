@@ -110,6 +110,23 @@ struct Meeting: Identifiable, Codable, Equatable {
         return segments.last { $0.start <= time } ?? segments.first
     }
 
+    /// Notes in the order of the meeting: by the time of the transcript line they belong to
+    /// (or the time they were written), followed by notes that have no position.
+    var sortedNotes: [Note] {
+        let starts = Dictionary(segments.map { ($0.id, $0.start) }, uniquingKeysWith: { first, _ in first })
+        func position(_ note: Note) -> TimeInterval? {
+            note.segmentID.flatMap { starts[$0] } ?? note.time
+        }
+        return notes.sorted { a, b in
+            switch (position(a), position(b)) {
+            case let (x?, y?): return x != y ? x < y : a.createdAt < b.createdAt
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return a.createdAt < b.createdAt
+            }
+        }
+    }
+
     func matches(_ query: String) -> Bool {
         let q = query.trimmingCharacters(in: .whitespaces)
         if q.isEmpty { return true }

@@ -84,6 +84,19 @@ struct TranscriptView: View {
                     .padding(.horizontal, 12)
                     .padding(.bottom, 6)
             }
+            if app.relinkingNoteID != nil {
+                HStack(spacing: 8) {
+                    Image(systemName: "link")
+                    Text("メモを紐づける発言をクリックしてください")
+                    Spacer()
+                    Button("キャンセル") { app.cancelRelinking() }
+                        .keyboardShortcut(.cancelAction)
+                }
+                .font(.callout)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.18))
+            }
             Divider()
             if meeting.segments.isEmpty && !isActive {
                 ContentUnavailableView(
@@ -102,8 +115,7 @@ struct TranscriptView: View {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(segments) { segment in
                         SegmentRow(
-                            segment: segment, meetingID: meeting.id, canPlay: canPlay,
-                            isPlaying: playingID == segment.id, editingID: $editingID)
+                            segment: segment, meetingID: meeting.id, canPlay: canPlay, editingID: $editingID)
                     }
                     if isActive {
                         provisional
@@ -112,7 +124,7 @@ struct TranscriptView: View {
                 }
                 .padding(12)
             }
-            .onChange(of: app.focusRequest) { scrollToFocused(proxy) }
+            .onChange(of: app.transcriptScrollRequest) { scrollToFocused(proxy) }
             .onChange(of: jumpTarget) {
                 guard let target = jumpTarget else { return }
                 jumpTarget = nil
@@ -123,16 +135,13 @@ struct TranscriptView: View {
                 }
             }
             .onChange(of: playingID) {
-                // Keep the line being heard in view.
-                guard app.player.isPlaying, let playingID else { return }
-                if markedOnly && meeting.segments.first(where: { $0.id == playingID })?.marker == nil { return }
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(playingID, anchor: .center) }
+                // The playback position leads: transcript and notes follow it.
+                app.playbackMoved(to: playingID)
             }
             .onChange(of: editingID) {
-                // Selecting a line moves the playback position to it.
-                guard canPlay, let segment = meeting.segments.first(where: { $0.id == editingID }) else { return }
-                app.player.load(MeetingStore.audioURL(for: meeting.id))
-                app.player.seek(to: segment.start)
+                // Selecting a line makes it the current position for the notes and the player too.
+                guard let segment = meeting.segments.first(where: { $0.id == editingID }) else { return }
+                app.select(segment, in: meeting)
             }
             .onChange(of: meeting.segments.count) { scrollToBottom(proxy) }
             .onChange(of: app.recording.provisionalText) { scrollToBottom(proxy) }
@@ -154,11 +163,13 @@ struct TranscriptView: View {
     }
 
     private func scrollToFocused(_ proxy: ScrollViewProxy) {
-        guard let id = app.focusedSegmentID, let segment = meeting.segments.first(where: { $0.id == id }) else { return }
+        guard let id = app.currentSegmentID, let segment = meeting.segments.first(where: { $0.id == id }) else { return }
         // Otherwise the next transcribed line would pull the view back to the bottom.
         autoScroll = false
         if markedOnly && segment.marker == nil {
-            // The line only exists in the list once the filter is off.
+            // The line is hidden by the filter. Lift it only when a note was picked on purpose,
+            // not every time playback passes an unmarked line.
+            guard app.selectionSource == .note else { return }
             markedOnly = false
             Task { @MainActor in proxy.scrollTo(id, anchor: .center) }
         } else {
@@ -178,8 +189,6 @@ private struct SegmentRow: View {
     let segment: TranscriptSegment
     let meetingID: UUID
     let canPlay: Bool
-    /// The playback position is on this line.
-    let isPlaying: Bool
     var editingID: FocusState<UUID?>.Binding
 
     @State private var hovering = false
@@ -187,7 +196,8 @@ private struct SegmentRow: View {
 
     private var isEditing: Bool { editingID.wrappedValue == segment.id }
 
-    private var isFocused: Bool { app.focusedSegmentID == segment.id }
+    /// This line is the current position shared with the notes and the player.
+    private var isCurrent: Bool { app.currentSegmentID == segment.id }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -214,7 +224,7 @@ private struct SegmentRow: View {
             } label: {
                 Text(formatTime(segment.start))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(isPlaying ? Color.accentColor : .secondary)
+                    .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
                     .frame(width: 52, alignment: .trailing)
             }
             .buttonStyle(.plain)
@@ -237,6 +247,8 @@ private struct SegmentRow: View {
                     if !isEditing && draft != segment.text { draft = segment.text }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Clicking a line that already has the cursor changes no focus, so select it here too.
+                .simultaneousGesture(TapGesture().onEnded(selectLine))
 
             if hovering {
                 markerButtons
@@ -249,12 +261,15 @@ private struct SegmentRow: View {
                 .fill(segment.marker.map { $0.color.opacity(0.28) } ?? (hovering ? Color.primary.opacity(0.04) : .clear)))
         // A frame only, so it never hides the marker colour underneath.
         .overlay {
-            if isFocused || isPlaying {
+            if isCurrent {
                 RoundedRectangle(cornerRadius: 5).strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 1.5)
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { editingID.wrappedValue = segment.id }
+        .onTapGesture {
+            editingID.wrappedValue = segment.id
+            selectLine()
+        }
         .onHover { hovering = $0 }
         .contextMenu {
             Button("この発言にメモを書く") { app.startNote(on: segment) }
@@ -329,6 +344,11 @@ private struct SegmentRow: View {
                 .help(segment.marker == color ? "マーカーを外す" : "\(color.label)のマーカーを付ける")
             }
         }
+    }
+
+    private func selectLine() {
+        guard let meeting = app.store.meeting(meetingID) else { return }
+        app.select(segment, in: meeting)
     }
 
     private func setMarker(_ marker: MarkerColor?) {

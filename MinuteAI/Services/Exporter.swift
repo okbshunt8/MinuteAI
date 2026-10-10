@@ -18,7 +18,7 @@ enum Exporter {
         }
         if !meeting.notes.isEmpty {
             out += "# メモ\n\n"
-            for note in meeting.notes {
+            for note in meeting.sortedNotes {
                 let category = categories.first { $0.id == note.categoryID }?.name ?? "メモ"
                 let time = note.time.map { " (\(formatTime($0)))" } ?? ""
                 let check = note.categoryID == NoteCategory.taskID ? (note.done ? "[x] " : "[ ] ") : ""
@@ -51,7 +51,7 @@ enum Exporter {
         }
         if !meeting.notes.isEmpty {
             out += "\n■ メモ\n"
-            for note in meeting.notes {
+            for note in meeting.sortedNotes {
                 let category = categories.first { $0.id == note.categoryID }?.name ?? "メモ"
                 let time = note.time.map { " \(formatTime($0))" } ?? ""
                 let images = (note.images ?? []).isEmpty ? "" : " (画像\(note.images?.count ?? 0)枚)"

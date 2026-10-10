@@ -16,19 +16,32 @@ final class AppState {
             guard selection != oldValue else { return }
             player.stop()
             noteTargetSegmentID = nil
+            relinkingNoteID = nil
             selectedNoteID = nil
-            focusedSegmentID = nil
+            currentSegmentID = nil
         }
     }
     var searchText = ""
 
     /// Transcript line the next note will be attached to.
     var noteTargetSegmentID: UUID?
+    /// The one "current position" shared by the transcript, the notes and the player: selecting a
+    /// note, selecting a transcript line or moving the playback position all set it, and the other
+    /// two follow.
+    private(set) var currentSegmentID: UUID?
+    /// What last moved the current position.
+    private(set) var selectionSource = SelectionSource.transcript
+    /// Note that was clicked. Only needed for notes that belong to no transcript line.
     private(set) var selectedNoteID: UUID?
-    /// Transcript line highlighted because of the selected note or the note being written.
-    private(set) var focusedSegmentID: UUID?
-    /// Bumped every time the transcript should scroll to `focusedSegmentID`.
-    private(set) var focusRequest = 0
+    /// Note waiting for a transcript line to be picked as its new place.
+    private(set) var relinkingNoteID: UUID?
+    /// Bumped when the transcript / the notes list should scroll to the current position.
+    private(set) var transcriptScrollRequest = 0
+    private(set) var notesScrollRequest = 0
+
+    enum SelectionSource {
+        case note, transcript, playback
+    }
 
     private(set) var summarizingID: UUID?
     private(set) var summaryStatus = ""
@@ -74,24 +87,102 @@ final class AppState {
     func startNote(on segment: TranscriptSegment) {
         selectedNoteID = nil
         noteTargetSegmentID = segment.id
-        focusedSegmentID = segment.id
+        currentSegmentID = segment.id
+        selectionSource = .transcript
     }
 
     func cancelNoteTarget() {
-        if focusedSegmentID == noteTargetSegmentID { focusedSegmentID = nil }
         noteTargetSegmentID = nil
     }
 
-    /// Selects a note and shows where in the transcript it was written. Selecting it again clears the highlight.
+    /// Selects a note: the transcript line it belongs to becomes the current position and the
+    /// player moves there. Selecting it again clears the selection.
     func select(_ note: Note, in meeting: Meeting) {
         if selectedNoteID == note.id {
             selectedNoteID = nil
-            focusedSegmentID = nil
+            currentSegmentID = nil
             return
         }
         selectedNoteID = note.id
-        focusedSegmentID = meeting.segment(for: note)?.id
-        if focusedSegmentID != nil { focusRequest += 1 }
+        selectionSource = .note
+        let segment = meeting.segment(for: note)
+        currentSegmentID = segment?.id
+        if let segment {
+            transcriptScrollRequest += 1
+            movePlayer(to: segment, in: meeting)
+        }
+    }
+
+    /// The next transcript line that is selected becomes this note's place.
+    func startRelinking(_ note: Note) {
+        relinkingNoteID = note.id
+        selectedNoteID = note.id
+    }
+
+    func cancelRelinking() {
+        relinkingNoteID = nil
+    }
+
+    /// Detaches a note from the transcript; it then sorts after the notes that have a position.
+    func unlink(_ note: Note, in meeting: Meeting) {
+        store.update(meeting.id) { meeting in
+            guard let index = meeting.notes.firstIndex(where: { $0.id == note.id }) else { return }
+            meeting.notes[index].segmentID = nil
+            meeting.notes[index].time = nil
+        }
+        if selectedNoteID == note.id { currentSegmentID = nil }
+    }
+
+    /// A transcript line was selected: its notes become selected and the player moves there.
+    func select(_ segment: TranscriptSegment, in meeting: Meeting) {
+        if let noteID = relinkingNoteID {
+            // The line was picked as the new place of a note.
+            relinkingNoteID = nil
+            store.update(meeting.id) { meeting in
+                guard let index = meeting.notes.firstIndex(where: { $0.id == noteID }) else { return }
+                meeting.notes[index].segmentID = segment.id
+                meeting.notes[index].time = segment.start
+            }
+            selectedNoteID = noteID
+            selectionSource = .transcript
+            currentSegmentID = segment.id
+            notesScrollRequest += 1
+            movePlayer(to: segment, in: meeting)
+            return
+        }
+        selectedNoteID = nil
+        selectionSource = .transcript
+        if currentSegmentID != segment.id {
+            currentSegmentID = segment.id
+            notesScrollRequest += 1
+        }
+        movePlayer(to: segment, in: meeting)
+    }
+
+    /// The playback position moved onto another transcript line (playing, or dragging the slider).
+    func playbackMoved(to segmentID: UUID?) {
+        guard let segmentID, segmentID != currentSegmentID else { return }
+        selectedNoteID = nil
+        selectionSource = .playback
+        currentSegmentID = segmentID
+        transcriptScrollRequest += 1
+        notesScrollRequest += 1
+    }
+
+    /// Whether the note belongs to the current position.
+    func isHighlighted(_ note: Note, in meeting: Meeting) -> Bool {
+        if selectedNoteID == note.id { return true }
+        guard let currentSegmentID else { return false }
+        return meeting.segment(for: note)?.id == currentSegmentID
+    }
+
+    private func movePlayer(to segment: TranscriptSegment, in meeting: Meeting) {
+        guard recording.meetingID != meeting.id, store.hasAudio(meeting.id) else { return }
+        player.load(MeetingStore.audioURL(for: meeting.id))
+        // Already inside this line (e.g. playback brought us here): don't jump back to its start.
+        let next = meeting.segments.first { $0.start > segment.start }?.start ?? .infinity
+        if player.currentTime >= segment.start && player.currentTime < next { return }
+        player.seek(to: segment.start)
     }
 
     /// The model that will write this meeting's summary: the meeting's own choice if it is still

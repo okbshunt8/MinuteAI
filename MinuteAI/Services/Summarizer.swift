@@ -61,7 +61,7 @@ enum Summarizer {
             let chapter = segment.chapterTitle.flatMap { $0.isEmpty ? nil : "【章: \($0)】\n" } ?? ""
             return "\(chapter)[\(formatTime(segment.start))]\(segment.marker != nil ? "【重要】" : "") \(segment.text)"
         }
-        let notes = notesText(meeting.notes, categories: categories)
+        let notes = notesText(meeting.sortedNotes, categories: categories)
         guard !lines.isEmpty || !notes.isEmpty else { throw SummaryError.nothingToSummarize }
 
         emit(.status("要約モデルを読み込み中…"))
