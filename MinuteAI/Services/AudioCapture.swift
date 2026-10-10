@@ -52,12 +52,32 @@ final class MonoResampler {
 /// Captures the default microphone as 48 kHz mono samples.
 final class MicrophoneCapture {
     var onSamples: (([Float]) -> Void)?
+    /// Called when capture could not be restarted after the input device changed.
+    var onFailure: ((Error) -> Void)?
 
     private var engine: AVAudioEngine?
     private let resampler = MonoResampler(sampleRate: AudioRecorder.sampleRate)
     private var configObserver: NSObjectProtocol?
+    /// True between start() and stop(); restarts after a device change only happen while it is set.
+    private var isWanted = false
+    private static let retryDelays: [TimeInterval] = [0.5, 1, 2, 4]
 
     func start() throws {
+        isWanted = true
+        do {
+            try startEngine()
+        } catch {
+            isWanted = false
+            throw error
+        }
+    }
+
+    func stop() {
+        isWanted = false
+        stopEngine()
+    }
+
+    private func startEngine() throws {
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -75,12 +95,30 @@ final class MicrophoneCapture {
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
-            self.stop()
-            try? self.start()
+            self.stopEngine()
+            self.restart(attempt: 0)
         }
     }
 
-    func stop() {
+    /// Right after a device is unplugged the new default input is often not ready yet, so try a few times.
+    private func restart(attempt: Int) {
+        // `engine == nil`: a retry left over from an earlier recording must not start a second engine.
+        guard isWanted, engine == nil else { return }
+        do {
+            try startEngine()
+        } catch {
+            stopEngine()
+            guard attempt < Self.retryDelays.count else {
+                onFailure?(error)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryDelays[attempt]) { [weak self] in
+                self?.restart(attempt: attempt + 1)
+            }
+        }
+    }
+
+    private func stopEngine() {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
         engine?.inputNode.removeTap(onBus: 0)
@@ -93,6 +131,8 @@ final class MicrophoneCapture {
 /// delivered as 48 kHz mono samples. No virtual audio driver is needed.
 final class SystemAudioCapture {
     var onSamples: (([Float]) -> Void)?
+    /// Called when capture could not be restarted after the output device changed.
+    var onFailure: ((Error) -> Void)?
 
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -112,7 +152,11 @@ final class SystemAudioCapture {
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
             self.stopTap()
-            try? self.startTap()
+            do {
+                try self.startTap()
+            } catch {
+                self.onFailure?(error)
+            }
         }
         deviceListener = listener
         AudioObjectAddPropertyListenerBlock(
@@ -129,7 +173,8 @@ final class SystemAudioCapture {
     }
 
     private func startTap() throws {
-        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
+        // Leave out our own sound, or playing back another meeting would end up in this recording.
+        let description = CATapDescription(stereoGlobalTapButExcludeProcesses: Self.ownProcessObject().map { [$0] } ?? [])
         description.uuid = UUID()
         description.name = "MinuteAI"
         description.isPrivate = true
@@ -199,6 +244,20 @@ final class SystemAudioCapture {
             AudioHardwareDestroyProcessTap(tapID)
         }
         tapID = AudioObjectID(kAudioObjectUnknown)
+    }
+
+    /// The Core Audio object that stands for this process, if it has one.
+    private static func ownProcessObject() -> AudioObjectID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var pid = getpid()
+        var object = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, UInt32(MemoryLayout<pid_t>.size), &pid, &size, &object)
+        return status == noErr && object != kAudioObjectUnknown ? object : nil
     }
 
     private static func defaultOutputDeviceUID() throws -> String {

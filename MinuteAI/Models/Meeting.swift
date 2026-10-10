@@ -59,6 +59,11 @@ struct NoteCategory: Identifiable, Codable, Hashable {
         }
     }
 
+    /// Name shown for a note's category, including notes whose category has since been deleted.
+    static func name(for id: String, in categories: [NoteCategory]) -> String {
+        categories.first { $0.id == id }?.name ?? "未分類"
+    }
+
     static let taskID = "task"
     static let memoID = "memo"
 

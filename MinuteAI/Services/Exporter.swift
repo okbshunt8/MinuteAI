@@ -4,7 +4,8 @@ import UniformTypeIdentifiers
 /// Writes a meeting out as Markdown, plain text or the recorded audio file.
 @MainActor
 enum Exporter {
-    static func markdown(_ meeting: Meeting, categories: [NoteCategory]) -> String {
+    /// `imageFolder` is the folder next to the Markdown file that holds the notes' images.
+    static func markdown(_ meeting: Meeting, categories: [NoteCategory], imageFolder: String? = nil) -> String {
         var out = "# \(meeting.title)\n\n"
         out += "- 日時: \(dateText(meeting.createdAt))\n"
         out += "- 録音時間: \(formatTime(meeting.duration))\n"
@@ -19,12 +20,17 @@ enum Exporter {
         if !meeting.notes.isEmpty {
             out += "# メモ\n\n"
             for note in meeting.sortedNotes {
-                let category = categories.first { $0.id == note.categoryID }?.name ?? "メモ"
+                let category = NoteCategory.name(for: note.categoryID, in: categories)
                 let time = note.time.map { " (\(formatTime($0)))" } ?? ""
                 let check = note.categoryID == NoteCategory.taskID ? (note.done ? "[x] " : "[ ] ") : ""
                 out += "- \(check)**\(category)**\(time) \(note.text.replacingOccurrences(of: "\n", with: " "))\n"
-                for name in note.images ?? [] {
-                    out += "  ![](\(NoteImages.url(name, meetingID: meeting.id).absoluteString))\n"
+                if let imageFolder {
+                    var allowed = CharacterSet.urlPathAllowed
+                    allowed.remove(charactersIn: "()")
+                    let folder = imageFolder.addingPercentEncoding(withAllowedCharacters: allowed) ?? imageFolder
+                    for name in note.images ?? [] {
+                        out += "  ![](\(folder)/\((name as NSString).lastPathComponent))\n"
+                    }
                 }
             }
             out += "\n"
@@ -52,7 +58,7 @@ enum Exporter {
         if !meeting.notes.isEmpty {
             out += "\n■ メモ\n"
             for note in meeting.sortedNotes {
-                let category = categories.first { $0.id == note.categoryID }?.name ?? "メモ"
+                let category = NoteCategory.name(for: note.categoryID, in: categories)
                 let time = note.time.map { " \(formatTime($0))" } ?? ""
                 let images = (note.images ?? []).isEmpty ? "" : " (画像\(note.images?.count ?? 0)枚)"
                 out += "[\(category)\(time)] \(note.text)\(images)\n"
@@ -80,6 +86,36 @@ enum Exporter {
         }
     }
 
+    /// Saves the meeting as Markdown. Images attached to notes are copied into a folder next to
+    /// the file and linked relatively, so the two can be moved or shared together.
+    static func saveMarkdown(_ meeting: Meeting, categories: [NoteCategory]) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = safeFileName(meeting.title)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let images = meeting.notes.flatMap { $0.images ?? [] }
+        let imageFolder = images.isEmpty ? nil : url.deletingPathExtension().lastPathComponent + "-images"
+        do {
+            if let imageFolder {
+                let folder = url.deletingLastPathComponent().appendingPathComponent(imageFolder, isDirectory: true)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                for name in images {
+                    let source = NoteImages.url(name, meetingID: meeting.id)
+                    let target = folder.appendingPathComponent(source.lastPathComponent)
+                    // A missing image must not stop the rest of the export.
+                    if FileManager.default.fileExists(atPath: source.path),
+                       !FileManager.default.fileExists(atPath: target.path) {
+                        try FileManager.default.copyItem(at: source, to: target)
+                    }
+                }
+            }
+            try markdown(meeting, categories: categories, imageFolder: imageFolder)
+                .write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
+
     static func saveAudio(of meeting: Meeting) {
         let source = MeetingStore.audioURL(for: meeting.id)
         let panel = NSSavePanel()
@@ -87,10 +123,19 @@ enum Exporter {
         panel.nameFieldStringValue = safeFileName(meeting.title)
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        // Picking the recording itself as the destination must not destroy it.
+        guard url.standardizedFileURL != source.standardizedFileURL else { return }
+        // Copy first and swap in afterwards, so a failed copy leaves any existing file intact.
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).m4a")
         do {
-            try? FileManager.default.removeItem(at: url)
-            try FileManager.default.copyItem(at: source, to: url)
+            try FileManager.default.copyItem(at: source, to: temporary)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: url)
+            }
         } catch {
+            try? FileManager.default.removeItem(at: temporary)
             NSAlert(error: error).runModal()
         }
     }

@@ -50,11 +50,30 @@ struct SidebarView: View {
                     .tag(meeting.id)
                     .contextMenu {
                         Button("削除…", role: .destructive) { deleteTarget = meeting }
-                            .disabled(app.recording.meetingID == meeting.id)
+                            .disabled(!app.canDelete(meeting.id))
                     }
             }
         }
         .searchable(text: $app.searchText, placement: .sidebar, prompt: "会議を検索")
+        .safeAreaInset(edge: .bottom) {
+            if let error = app.store.saveError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(8)
+            }
+            if !app.store.unreadableFolders.isEmpty {
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting(app.store.unreadableFolders)
+                } label: {
+                    Label("読み込めない会議が\(app.store.unreadableFolders.count)件あります", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                }
+                .buttonStyle(.link)
+                .padding(8)
+                .help("meeting.json が壊れている会議です。クリックすると Finder でフォルダを表示します")
+            }
+        }
         .overlay {
             if results.isEmpty {
                 Text(app.searchText.isEmpty ? "会議はまだありません" : "一致する会議がありません")

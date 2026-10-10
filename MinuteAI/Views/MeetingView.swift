@@ -31,10 +31,16 @@ struct MeetingView: View {
                     .padding(8)
                     .fixedSize(horizontal: false, vertical: true)
                     Divider()
-                    Group {
-                        switch sidePanel {
-                        case .notes: NotesView(meeting: meeting)
-                        case .summary: SummaryView(meeting: meeting)
+                    ZStack {
+                        // Kept alive while the summary is shown, so a note being written is not lost.
+                        NotesView(meeting: meeting, isVisible: sidePanel == .notes)
+                            .opacity(sidePanel == .notes ? 1 : 0)
+                            .allowsHitTesting(sidePanel == .notes)
+                            // Also switches off its keyboard shortcuts and keeps focus out of it.
+                            .disabled(sidePanel != .notes)
+                            .accessibilityHidden(sidePanel != .notes)
+                        if sidePanel == .summary {
+                            SummaryView(meeting: meeting)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -80,6 +86,18 @@ struct MeetingView: View {
                     .textFieldStyle(.plain)
                     .font(.title2.weight(.semibold))
                 usedModels
+                if recording.warningsMeetingID == meeting.id {
+                    ForEach(recording.warnings, id: \.self) { warning in
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    if !recording.warnings.isEmpty && !isActive {
+                        Button("閉じる") { recording.dismissWarnings() }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                    }
+                }
             }
             Spacer()
             if isActive {
@@ -195,9 +213,7 @@ struct MeetingView: View {
         ToolbarItem(placement: .primaryAction) {
             Menu {
                 Button("Markdown (.md)…") {
-                    Exporter.save(
-                        text: Exporter.markdown(meeting, categories: app.settings.categories),
-                        suggestedName: meeting.title, type: .init(filenameExtension: "md") ?? .plainText)
+                    Exporter.saveMarkdown(meeting, categories: app.settings.categories)
                 }
                 Button("テキスト (.txt)…") {
                     Exporter.save(

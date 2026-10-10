@@ -33,6 +33,7 @@ final class AppSettings {
     }
 
     func category(_ id: String) -> NoteCategory {
-        categories.first { $0.id == id } ?? NoteCategory(id: id, name: "未分類", colorName: "gray")
+        categories.first { $0.id == id }
+            ?? NoteCategory(id: id, name: NoteCategory.name(for: id, in: categories), colorName: "gray")
     }
 }

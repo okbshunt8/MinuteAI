@@ -4,6 +4,8 @@ import Observation
 @MainActor
 @Observable
 final class AppState {
+    static let shared = AppState()
+
     let store: MeetingStore
     let settings: AppSettings
     let whisper: WhisperModelManager
@@ -45,12 +47,16 @@ final class AppState {
 
     private(set) var summarizingID: UUID?
     private(set) var summaryStatus = ""
-    var summaryError: String?
+    /// The summary being written. It replaces the meeting's summary only when it is complete.
+    private(set) var summaryDraft = ""
+    private(set) var summaryError: String?
+    private(set) var summaryErrorID: UUID?
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
 
     private(set) var chapteringID: UUID?
     private(set) var chapterStatus = ""
-    var chapterError: String?
+    private(set) var chapterError: String?
+    private(set) var chapterErrorID: UUID?
     @ObservationIgnored private var chapterTask: Task<Void, Never>?
 
     /// The language model handles one job at a time.
@@ -75,7 +81,7 @@ final class AppState {
     }
 
     func deleteMeeting(_ id: UUID) {
-        guard recording.meetingID != id, summarizingID != id, chapteringID != id else { return }
+        guard canDelete(id) else { return }
         if selection == id {
             player.stop()
             selection = nil
@@ -189,41 +195,58 @@ final class AppState {
     /// downloaded, otherwise the default.
     func summaryModelID(for meeting: Meeting) -> String {
         if let choice = meeting.summaryModelChoice, llm.state(choice) == .downloaded { return choice }
+        // The default may have been deleted since: use another downloaded model rather than none.
+        if llm.state(settings.llmModelID) != .downloaded, let other = llm.downloadedModels.first { return other.id }
         return settings.llmModelID
+    }
+
+    /// A meeting that is being recorded, summarized or divided into chapters cannot be deleted.
+    func canDelete(_ id: UUID) -> Bool {
+        recording.meetingID != id && summarizingID != id && chapteringID != id
     }
 
     func summarize(_ id: UUID) {
         guard !isModelBusy, let meeting = store.meeting(id) else { return }
         summarizingID = id
         summaryStatus = "準備中…"
+        summaryDraft = ""
         summaryError = nil
         let modelID = summaryModelID(for: meeting)
-        let events = Summarizer.summarize(
-            meeting: meeting, categories: settings.categories,
-            modelFolder: LLMModelManager.folder(for: modelID))
+        let categories = settings.categories
         summaryTask = Task {
             do {
-                for try await event in events {
-                    switch event {
-                    case .status(let status): summaryStatus = status
-                    case .text(let text):
-                        store.update(id) {
-                            $0.summary = text
-                            $0.summaryModel = modelID
+                let summary = try await Summarizer.summarize(
+                    meeting: meeting, categories: categories, modelFolder: LLMModelManager.folder(for: modelID)
+                ) { event in
+                    Task { @MainActor in
+                        guard self.summarizingID == id, self.summaryTask?.isCancelled == false else { return }
+                        switch event {
+                        case .status(let status): self.summaryStatus = status
+                        case .text(let text): self.summaryDraft = text
                         }
                     }
+                }
+                try Task.checkCancellation()
+                // Only now does the previous summary (possibly edited by hand) get replaced.
+                store.update(id) {
+                    $0.summary = summary
+                    $0.summaryModel = modelID
                 }
             } catch is CancellationError {
             } catch {
                 summaryError = error.localizedDescription
+                summaryErrorID = id
             }
             summarizingID = nil
             summaryStatus = ""
+            summaryDraft = ""
         }
     }
 
+    /// The model stays busy until it has actually stopped, which can take a moment.
     func cancelSummary() {
         summaryTask?.cancel()
+        summaryStatus = "中止しています…"
     }
 
     /// Has the language model divide the transcript into chapters. Headings written by hand are kept.
@@ -236,13 +259,15 @@ final class AppState {
         chapterTask = Task {
             do {
                 let chapters = try await Summarizer.chapters(meeting: meeting, modelFolder: modelFolder) { status in
-                    Task { @MainActor [weak self] in
-                        if self?.chapteringID == id { self?.chapterStatus = status }
+                    Task { @MainActor in
+                        guard self.chapteringID == id, self.chapterTask?.isCancelled == false else { return }
+                        self.chapterStatus = status
                     }
                 }
                 try Task.checkCancellation()
                 if chapters.isEmpty {
                     chapterError = "章の区切りを見つけられませんでした。"
+                    chapterErrorID = id
                 } else {
                     store.update(id) { meeting in
                         for index in meeting.segments.indices {
@@ -258,6 +283,7 @@ final class AppState {
             } catch is CancellationError {
             } catch {
                 chapterError = error.localizedDescription
+                chapterErrorID = id
             }
             chapteringID = nil
             chapterStatus = ""
@@ -266,6 +292,7 @@ final class AppState {
 
     func cancelChapters() {
         chapterTask?.cancel()
+        chapterStatus = "中止しています…"
     }
 
     func willTerminate() {

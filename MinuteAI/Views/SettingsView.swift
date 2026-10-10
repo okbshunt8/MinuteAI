@@ -27,6 +27,10 @@ private struct ModelRow: View {
     let download: () -> Void
     let cancel: () -> Void
     let delete: () -> Void
+    /// Takes a model that is not downloaded off the list (models added by hand or from the search).
+    var remove: (() -> Void)?
+    /// The model may be in use: it can't be deleted right now. Downloads can still be started and cancelled.
+    var locked = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -46,12 +50,17 @@ private struct ModelRow: View {
             switch state {
             case .notDownloaded:
                 Button("ダウンロード", action: download)
+                if let remove {
+                    Button("一覧から削除", action: remove)
+                        .disabled(locked)
+                }
             case .downloading(let fraction):
                 ProgressView(value: fraction).frame(width: 90)
                 Text("\(Int(fraction * 100))%").font(.caption.monospacedDigit()).frame(width: 34, alignment: .trailing)
                 Button("中止", action: cancel)
             case .downloaded:
                 Button("削除", role: .destructive, action: delete)
+                    .disabled(locked)
             }
         }
         .padding(.vertical, 2)
@@ -143,8 +152,9 @@ private struct SummarySettings: View {
                             }
                         },
                         cancel: { app.llm.cancelDownload(model.id) },
-                        delete: { app.llm.delete(model.id) })
-                    .disabled(app.summarizingID != nil)
+                        delete: { app.llm.delete(model.id) },
+                        remove: app.llm.added.contains(model) ? { app.llm.delete(model.id) } : nil,
+                        locked: app.isModelBusy)
                 }
                 if let error = app.llm.lastError {
                     Text(error).font(.caption).foregroundStyle(.red)

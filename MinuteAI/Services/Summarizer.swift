@@ -33,29 +33,14 @@ enum Summarizer {
     private static let singlePassLimit = 14_000
     private static let partSize = 9_000
 
+    /// Returns the finished summary. It only returns (or throws) once the model has really stopped
+    /// working, so a caller that waits for it never has two models loaded at once.
     static func summarize(
-        meeting: Meeting, categories: [NoteCategory], modelFolder: URL
-    ) -> AsyncThrowingStream<Event, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await run(meeting: meeting, categories: categories, modelFolder: modelFolder) {
-                        continuation.yield($0)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-                // Give the model's memory back; the next recording needs it more than we do.
-                Memory.clearCache()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    private static func run(
-        meeting: Meeting, categories: [NoteCategory], modelFolder: URL, emit: (Event) -> Void
-    ) async throws {
+        meeting: Meeting, categories: [NoteCategory], modelFolder: URL,
+        onEvent emit: @escaping @Sendable (Event) -> Void
+    ) async throws -> String {
+        // Give the model's memory back; the next recording needs it more than we do.
+        defer { Memory.clearCache() }
         guard HFDownloader.isComplete(modelFolder) else { throw SummaryError.modelNotDownloaded }
         let lines = meeting.segments.map { segment in
             let chapter = segment.chapterTitle.flatMap { $0.isEmpty ? nil : "【章: \($0)】\n" } ?? ""
@@ -118,7 +103,7 @@ enum Summarizer {
         # 文字起こし
         \(transcript.isEmpty ? "(なし)" : transcript)
         """
-        _ = try await generate(container, prompt: prompt, maxTokens: 2500) { emit(.text($0)) }
+        return try await generate(container, prompt: prompt, maxTokens: 2500) { emit(.text($0)) }
     }
 
     private static func generate(
@@ -129,11 +114,20 @@ enum Summarizer {
             container, instructions: system,
             generateParameters: GenerateParameters(maxTokens: maxTokens, temperature: temperature))
         var raw = ""
-        for try await chunk in session.streamResponse(to: prompt) {
-            try Task.checkCancellation()
-            raw += chunk
-            onText(clean(raw))
+        do {
+            for try await chunk in session.streamResponse(to: prompt) {
+                try Task.checkCancellation()
+                raw += chunk
+                onText(clean(raw))
+            }
+        } catch {
+            await session.synchronize()
+            throw error
         }
+        // Leaving the loop (also when cancelled) only asks the model to stop; wait until it has,
+        // and never hand back a cut-off answer as if it were complete.
+        await session.synchronize()
+        try Task.checkCancellation()
         return clean(raw)
     }
 
@@ -152,7 +146,7 @@ enum Summarizer {
 
     private static func notesText(_ notes: [Note], categories: [NoteCategory]) -> String {
         notes.map { note in
-            let category = categories.first { $0.id == note.categoryID }?.name ?? "メモ"
+            let category = NoteCategory.name(for: note.categoryID, in: categories)
             let time = note.time.map { " (\(formatTime($0)))" } ?? ""
             let done = note.categoryID == NoteCategory.taskID && note.done ? " [完了]" : ""
             return "- [\(category)]\(time)\(done) \(note.text.replacingOccurrences(of: "\n", with: " "))"

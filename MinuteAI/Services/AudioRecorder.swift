@@ -10,6 +10,8 @@ final class AudioRecorder {
     var onTranscriptionSamples: (([Float]) -> Void)?
     /// RMS level (0...1) of the microphone and system audio, called on the mixer queue.
     var onLevels: ((Float, Float) -> Void)?
+    /// A problem that does not stop the recording but that the user must hear about. May be called from any queue.
+    var onProblem: ((String) -> Void)?
 
     private let microphone = MicrophoneCapture()
     private let systemAudio = SystemAudioCapture()
@@ -29,17 +31,23 @@ final class AudioRecorder {
     private var ticksSinceSync = 0
     private let mixFormat = AVAudioFormat(standardFormatWithSampleRate: AudioRecorder.sampleRate, channels: 1)!
     private let downsampler = MonoResampler(sampleRate: AudioRecorder.transcriptionSampleRate)
+    /// Guarded by `lock`: written on the mixer queue, read from the main thread.
     private var framesWritten: Int64 = 0
+    private var reportedWriteFailure = false
+    /// True after a recording whose .m4a is incomplete; its raw copy was kept so it can be rebuilt.
+    private(set) var needsRecovery = false
 
     /// Seconds of audio written so far.
-    var duration: TimeInterval { Double(framesWritten) / Self.sampleRate }
+    var duration: TimeInterval { Double(lock.withLock { framesWritten }) / Self.sampleRate }
 
     func start(to url: URL, microphone useMic: Bool, systemAudio useSystem: Bool) throws {
         self.useMic = useMic
         self.useSystem = useSystem
         micQueue.removeAll()
         systemQueue.removeAll()
-        framesWritten = 0
+        lock.withLock { framesWritten = 0 }
+        reportedWriteFailure = false
+        needsRecovery = false
 
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -52,6 +60,15 @@ final class AudioRecorder {
         FileManager.default.createFile(atPath: safetyURL.path, contents: nil)
         safetyCopy = try? FileHandle(forWritingTo: safetyURL)
         self.safetyURL = safetyURL
+        if safetyCopy == nil {
+            onProblem?("録音の控えを作成できませんでした。録音中にアプリが終了すると音声を復旧できません。")
+        }
+        microphone.onFailure = { [weak self] error in
+            self?.onProblem?("入力デバイスの切り替え後にマイクの録音を再開できませんでした。以降のマイク音声は録音されません。(\(error.localizedDescription))")
+        }
+        systemAudio.onFailure = { [weak self] error in
+            self?.onProblem?("出力デバイスの切り替え後にシステム音声の録音を再開できませんでした。以降の相手側の音声は録音されません。(\(error.localizedDescription))")
+        }
 
         do {
             if useMic {
@@ -101,10 +118,16 @@ final class AudioRecorder {
             mix(flush: true)
             file?.close()
             file = nil
-            // The .m4a is complete now, so the raw copy is no longer needed.
             try? safetyCopy?.close()
+            let hadSafetyCopy = safetyCopy != nil
             safetyCopy = nil
-            if let safetyURL { try? FileManager.default.removeItem(at: safetyURL) }
+            if reportedWriteFailure && hadSafetyCopy {
+                // The .m4a has gaps; the raw copy may be the only complete recording.
+                needsRecovery = true
+            } else if let safetyURL {
+                // The .m4a is complete now, so the raw copy is no longer needed.
+                try? FileManager.default.removeItem(at: safetyURL)
+            }
         }
         return duration
     }
@@ -143,9 +166,13 @@ final class AudioRecorder {
 
         do {
             try file?.write(from: buffer)
-            framesWritten += Int64(count)
+            lock.withLock { framesWritten += Int64(count) }
         } catch {
             NSLog("MinuteAI: failed to write audio: \(error)")
+            if !reportedWriteFailure {
+                reportedWriteFailure = true
+                onProblem?("音声ファイルへの書き込みに失敗しました。ディスクの空き容量を確認してください。(\(error.localizedDescription))")
+            }
         }
         writeSafetyCopy(output, count: count)
         onLevels?(Self.rms(mic), Self.rms(system))
@@ -210,6 +237,13 @@ final class AudioRecorder {
             try? FileManager.default.removeItem(at: temporaryURL)
             try? FileManager.default.removeItem(at: safetyURL)
             return 0
+        }
+        // If the existing file is playable and at least as long (the raw copy itself may have been
+        // cut short, e.g. by a full disk), it is the better one: keep it.
+        if let existing = try? AVAudioFile(forReading: audioURL), existing.length >= frames {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            try? FileManager.default.removeItem(at: safetyURL)
+            return Double(existing.length) / existing.processingFormat.sampleRate
         }
         try? FileManager.default.removeItem(at: audioURL)
         try FileManager.default.moveItem(at: temporaryURL, to: audioURL)

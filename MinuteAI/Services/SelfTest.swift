@@ -79,6 +79,8 @@ enum SelfTest {
             case .final(let segment):
                 print("[\(at)s] FINAL \(formatTime(segment.start))-\(formatTime(segment.end)) \(segment.text)")
                 meeting.segments.append(segment)
+            case .failed(let start, let end):
+                print("[\(at)s] FAILED \(formatTime(start))-\(formatTime(end))")
             }
         }
         transcriber.start()
@@ -115,14 +117,10 @@ enum SelfTest {
             print("chapter at line \(line): \(chapter.title)")
         }
         loadStart = Date()
-        var summary = ""
-        for try await event in Summarizer.summarize(
-            meeting: meeting, categories: app.settings.categories, modelFolder: LLMModelManager.folder(for: modelID))
-        {
-            switch event {
-            case .status(let status): print("status: \(status)")
-            case .text(let text): summary = text
-            }
+        let summary = try await Summarizer.summarize(
+            meeting: meeting, categories: app.settings.categories, modelFolder: LLMModelManager.folder(for: modelID)
+        ) { event in
+            if case .status(let status) = event { print("status: \(status)") }
         }
         print("summary in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s:\n\(summary)")
     }

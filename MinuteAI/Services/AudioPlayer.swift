@@ -34,6 +34,21 @@ final class AudioPlayer {
         engine.attach(node)
         engine.attach(equalizer)
         equalizer.globalGain = gain
+        // The output device changed (e.g. headphones unplugged): the engine has stopped by itself.
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.outputChanged() }
+        }
+    }
+
+    /// Carries on from the same position on the new output device, or shows the player as paused.
+    private func outputChanged() {
+        guard isPlaying else { return }
+        let position = currentTime
+        pause()
+        currentTime = position
+        play(from: position)
     }
 
     /// Makes the file ready to play. Does nothing if it is already loaded.

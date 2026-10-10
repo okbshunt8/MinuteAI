@@ -12,7 +12,10 @@ enum NoteImages {
     }
 
     static func url(_ name: String, meetingID: UUID) -> URL {
-        folder(for: meetingID).appendingPathComponent(name)
+        // Names come from meeting.json; never let one point at anything but a file in the images folder.
+        let file = (name as NSString).lastPathComponent
+        let isSafe = !file.isEmpty && file != "." && file != ".." && file != "/"
+        return folder(for: meetingID).appendingPathComponent(isSafe ? file : "invalid-image-name")
     }
 
     static func image(_ name: String, meetingID: UUID) -> NSImage? {
@@ -40,7 +43,8 @@ enum NoteImages {
     }
 
     static func importFiles(_ urls: [URL], meetingID: UUID) -> [String] {
-        urls.compactMap { NSImage(contentsOf: $0) }.compactMap { save($0, meetingID: meetingID) }
+        // Local files only: a dropped web link would otherwise be fetched from the network.
+        urls.filter(\.isFileURL).compactMap { NSImage(contentsOf: $0) }.compactMap { save($0, meetingID: meetingID) }
     }
 
     /// Image files copied in Finder, or image data copied from a screenshot, browser or other app.
@@ -52,22 +56,34 @@ enum NoteImages {
         return NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
     }
 
+    /// Image data on the clipboard itself. Deliberately not NSImage(pasteboard:), which could
+    /// also follow a copied web address and load it from the network.
+    private static func pasteboardImage() -> NSImage? {
+        for type in [NSPasteboard.PasteboardType.png, .tiff] {
+            if let data = NSPasteboard.general.data(forType: type), let image = NSImage(data: data) { return image }
+        }
+        return nil
+    }
+
+    private static var pasteboardHasImageData: Bool {
+        NSPasteboard.general.availableType(from: [.png, .tiff]) != nil
+    }
+
     static var pasteboardHasImage: Bool {
-        !pasteboardFiles().isEmpty || NSPasteboard.general.canReadObject(forClasses: [NSImage.self])
+        !pasteboardFiles().isEmpty || pasteboardHasImageData
     }
 
     /// True when pasting should attach an image rather than insert text: the clipboard holds
     /// image files, or image data with no text alongside it.
     static var pasteboardIsImageOnly: Bool {
         if !pasteboardFiles().isEmpty { return true }
-        return NSPasteboard.general.canReadObject(forClasses: [NSImage.self])
-            && NSPasteboard.general.string(forType: .string) == nil
+        return pasteboardHasImageData && NSPasteboard.general.string(forType: .string) == nil
     }
 
     static func importPasteboard(meetingID: UUID) -> [String] {
         let files = pasteboardFiles()
         if !files.isEmpty { return importFiles(files, meetingID: meetingID) }
-        guard let image = NSImage(pasteboard: .general), let name = save(image, meetingID: meetingID) else { return [] }
+        guard let image = pasteboardImage(), let name = save(image, meetingID: meetingID) else { return [] }
         return [name]
     }
 

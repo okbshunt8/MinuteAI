@@ -8,6 +8,10 @@ final class MeetingStore {
     private(set) var meetings: [Meeting] = []
     /// Meetings whose recording was cut off and is being rebuilt from its raw copy.
     private(set) var recovering: Set<UUID> = []
+    /// Meeting folders whose meeting.json exists but could not be read. They are left untouched.
+    private(set) var unreadableFolders: [URL] = []
+    /// Set while changes could not be written to disk. They stay queued and are retried.
+    private(set) var saveError: String?
 
     @ObservationIgnored private var pendingSaves: Set<UUID> = []
     @ObservationIgnored private var saveTask: Task<Void, Never>?
@@ -42,11 +46,17 @@ final class MeetingStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let folders = (try? fm.contentsOfDirectory(at: Self.meetingsURL, includingPropertiesForKeys: nil)) ?? []
-        meetings = folders.compactMap { folder in
-            guard let data = try? Data(contentsOf: folder.appendingPathComponent("meeting.json")) else { return nil }
-            return try? decoder.decode(Meeting.self, from: data)
+        var loaded: [Meeting] = []
+        for folder in folders {
+            guard let data = try? Data(contentsOf: folder.appendingPathComponent("meeting.json")) else { continue }
+            do {
+                loaded.append(try decoder.decode(Meeting.self, from: data))
+            } catch {
+                NSLog("MinuteAI: could not read \(folder.lastPathComponent)/meeting.json: \(error)")
+                unreadableFolders.append(folder)
+            }
         }
-        .sorted { $0.createdAt > $1.createdAt }
+        meetings = loaded.sorted { $0.createdAt > $1.createdAt }
     }
 
     func meeting(_ id: UUID?) -> Meeting? {
@@ -83,23 +93,26 @@ final class MeetingStore {
 
     /// Repairs recordings that never got a clean stop. Call once at launch, before anything records.
     func recoverInterruptedRecordings() {
-        let interrupted = meetings.map(\.id).filter {
-            FileManager.default.fileExists(atPath: AudioRecorder.safetyCopyURL(for: Self.audioURL(for: $0)).path)
-        }
-        recovering = Set(interrupted)
-        for id in interrupted {
-            Task {
-                let audioURL = Self.audioURL(for: id)
-                let duration = try? await Task.detached(priority: .utility) {
-                    try AudioRecorder.recover(audioURL: audioURL)
-                }.value
-                if let duration, duration > 0 {
-                    update(id) { $0.duration = max($0.duration, duration) }
-                } else {
-                    NSLog("MinuteAI: could not recover the recording of meeting \(id)")
-                }
-                recovering.remove(id)
+        for id in meetings.map(\.id) { recoverRecording(id) }
+    }
+
+    /// Rebuilds one meeting's audio from its raw copy, if it has one and is not already being rebuilt.
+    func recoverRecording(_ id: UUID) {
+        let audioURL = Self.audioURL(for: id)
+        guard !recovering.contains(id),
+              FileManager.default.fileExists(atPath: AudioRecorder.safetyCopyURL(for: audioURL).path)
+        else { return }
+        recovering.insert(id)
+        Task {
+            let duration = try? await Task.detached(priority: .utility) {
+                try AudioRecorder.recover(audioURL: audioURL)
+            }.value
+            if let duration, duration > 0 {
+                update(id) { $0.duration = max($0.duration, duration) }
+            } else {
+                NSLog("MinuteAI: could not recover the recording of meeting \(id)")
             }
+            recovering.remove(id)
         }
     }
 
@@ -119,6 +132,8 @@ final class MeetingStore {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        var failed: Set<UUID> = []
+        var failure: Error?
         for id in pendingSaves {
             guard let meeting = meetings.first(where: { $0.id == id }) else { continue }
             do {
@@ -126,8 +141,21 @@ final class MeetingStore {
                 try encoder.encode(meeting).write(to: Self.jsonURL(for: id), options: .atomic)
             } catch {
                 NSLog("MinuteAI: failed to save meeting \(id): \(error)")
+                failed.insert(id)
+                failure = error
             }
         }
-        pendingSaves.removeAll()
+        pendingSaves = failed
+        if let failure {
+            saveError = "会議の内容を保存できませんでした。ディスクの空き容量を確認してください。(\(failure.localizedDescription))"
+            // Keep trying: the transcript and notes exist only in memory until this succeeds.
+            saveTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(5))
+                guard !Task.isCancelled else { return }
+                self?.flush()
+            }
+        } else {
+            saveError = nil
+        }
     }
 }

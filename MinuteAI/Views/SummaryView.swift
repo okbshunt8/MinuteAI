@@ -10,6 +10,10 @@ struct SummaryView: View {
     private var modelID: String { app.summaryModelID(for: meeting) }
     private var modelReady: Bool { app.llm.state(modelID) == .downloaded }
     private var isRecordingHere: Bool { app.recording.meetingID == meeting.id }
+    /// While a new summary is being written it is shown in place of the stored one, which stays untouched.
+    private var shownSummary: String {
+        isSummarizing && !app.summaryDraft.isEmpty ? app.summaryDraft : meeting.summary
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,7 +24,7 @@ struct SummaryView: View {
                     "要約はまだありません", systemImage: "sparkles",
                     description: Text("会議が終わったら「要約を生成」を押してください。マーカーを付けた発言とメモを重視して要約します。"))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if editing {
+            } else if editing && !isSummarizing {
                 TextEditor(text: Binding(
                     get: { meeting.summary },
                     set: { summary in app.store.update(meeting.id) { $0.summary = summary } }))
@@ -30,7 +34,7 @@ struct SummaryView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    MarkdownText(text: meeting.summary)
+                    MarkdownText(text: shownSummary)
                         .padding(12)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -98,7 +102,7 @@ struct SummaryView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let error = app.summaryError {
+            if let error = app.summaryError, app.summaryErrorID == meeting.id {
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -147,6 +151,9 @@ struct MarkdownText: View {
 
     private func inline(_ string: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: string, options: options)) ?? AttributedString(string)
+        guard var text = try? AttributedString(markdown: string, options: options) else { return AttributedString(string) }
+        // The text comes from a language model that read the meeting: never make its links clickable.
+        text.link = nil
+        return text
     }
 }

@@ -76,7 +76,7 @@ struct TranscriptView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            if let error = app.chapterError, app.chapteringID == nil {
+            if let error = app.chapterError, app.chapterErrorID == meeting.id, app.chapteringID == nil {
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)

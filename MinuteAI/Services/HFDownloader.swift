@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Minimal Hugging Face downloader: fetches the weight/config/tokenizer files of a model repository
@@ -7,6 +8,12 @@ enum HFDownloader {
         let type: String
         let path: String
         let size: Int64?
+        let lfs: LFS?
+
+        struct LFS: Decodable {
+            /// SHA-256 of the file.
+            let oid: String
+        }
     }
 
     private static let extensions: Set<String> = ["safetensors", "json", "jinja"]
@@ -26,6 +33,11 @@ enum HFDownloader {
 
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        // Left behind if the app quit while a file was being verified.
+        for leftover in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        where leftover.pathExtension == "partial" {
+            try? fm.removeItem(at: leftover)
+        }
         let total = max(files.reduce(Int64(0)) { $0 + ($1.size ?? 0) }, 1)
         var finished: Int64 = 0
 
@@ -39,14 +51,33 @@ enum HFDownloader {
                     throw URLError(.badURL)
                 }
                 let base = finished
-                try await downloadFile(url, to: target) { received in
+                // Only a verified file gets its final name, so a half-checked one is never mistaken for complete.
+                let partial = target.appendingPathExtension("partial")
+                try await downloadFile(url, to: partial) { received in
                     progress(Double(base + received) / Double(total))
                 }
+                // Large files carry a checksum: catch truncated or corrupted downloads.
+                if let expected = file.lfs?.oid, try sha256(of: partial) != expected.lowercased() {
+                    try? fm.removeItem(at: partial)
+                    throw DownloadError.corrupted(file.path)
+                }
+                try? fm.removeItem(at: target)
+                try fm.moveItem(at: partial, to: target)
             }
             finished += size
             progress(Double(finished) / Double(total))
         }
         fm.createFile(atPath: folder.appendingPathComponent(completeMarker).path, contents: nil)
+    }
+
+    private static func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 4 << 20), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// The files of a repository that make up the model.
@@ -129,8 +160,27 @@ enum HFDownloader {
     }
 
     private final class TaskBox: @unchecked Sendable {
-        var task: URLSessionDownloadTask?
+        private let lock = NSLock()
+        private var task: URLSessionDownloadTask?
+        private var isCancelled = false
         var observation: NSKeyValueObservation?
+
+        /// Cancels right away if cancellation was requested before the task existed.
+        func set(_ task: URLSessionDownloadTask) {
+            let cancelNow = lock.withLock { () -> Bool in
+                self.task = task
+                return isCancelled
+            }
+            if cancelNow { task.cancel() }
+        }
+
+        func cancel() {
+            let task = lock.withLock { () -> URLSessionDownloadTask? in
+                isCancelled = true
+                return self.task
+            }
+            task?.cancel()
+        }
     }
 
     private static func downloadFile(
@@ -159,11 +209,11 @@ enum HFDownloader {
                 box.observation = task.observe(\.countOfBytesReceived) { task, _ in
                     onBytes(task.countOfBytesReceived)
                 }
-                box.task = task
                 task.resume()
+                box.set(task)
             }
         } onCancel: {
-            box.task?.cancel()
+            box.cancel()
         }
     }
 
@@ -171,9 +221,11 @@ enum HFDownloader {
         case repositoryNotFound(String)
         case noWeights(String)
         case unsupported(String)
+        case corrupted(String)
 
         var errorDescription: String? {
             switch self {
+            case .corrupted(let file): return "「\(file)」が正しくダウンロードできませんでした。もう一度お試しください。"
             case .unsupported(let repo): return "「\(repo)」はこのアプリが対応していない種類のモデルです。"
             case .repositoryNotFound(let repo): return "モデル「\(repo)」が見つかりません。"
             case .noWeights(let repo): return "「\(repo)」は MLX 形式 (safetensors) のモデルではありません。"

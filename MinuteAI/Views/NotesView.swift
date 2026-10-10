@@ -4,6 +4,8 @@ import SwiftUI
 struct NotesView: View {
     @Environment(AppState.self) private var app
     let meeting: Meeting
+    /// False while the summary is shown in front of the notes.
+    var isVisible = true
 
     @State private var draft = ""
     @State private var categoryID = NoteCategory.memoID
@@ -60,11 +62,24 @@ struct NotesView: View {
                 categoryID = app.settings.categories.first?.id ?? NoteCategory.memoID
             }
             if app.noteTargetSegmentID != nil { inputFocused = true }
-            installPasteMonitor()
+            if isVisible { installPasteMonitor() }
         }
         .onDisappear {
-            if let pasteMonitor { NSEvent.removeMonitor(pasteMonitor) }
-            pasteMonitor = nil
+            removePasteMonitor()
+            // Images of a note that was never added would otherwise stay on disk forever.
+            NoteImages.delete(pendingImages, meetingID: meeting.id)
+            pendingImages = []
+        }
+        .onChange(of: isVisible) {
+            // The monitor only exists while the notes are in front, so ⌘V elsewhere is left alone.
+            if isVisible {
+                installPasteMonitor()
+                // Coming to the front to write about a transcript line: the field was disabled until now.
+                if app.noteTargetSegmentID != nil { inputFocused = true }
+            } else {
+                removePasteMonitor()
+                inputFocused = false
+            }
         }
         .onChange(of: app.noteTargetSegmentID) {
             if app.noteTargetSegmentID != nil { inputFocused = true }
@@ -88,6 +103,11 @@ struct NotesView: View {
             pasteImage()
             return nil
         }
+    }
+
+    private func removePasteMonitor() {
+        if let pasteMonitor { NSEvent.removeMonitor(pasteMonitor) }
+        pasteMonitor = nil
     }
 
     private func pasteImage() {
