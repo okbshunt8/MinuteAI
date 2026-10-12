@@ -105,6 +105,24 @@ private struct TranscriptionSettings: View {
                 Toggle("システム音声(リモート会議の相手の声)", isOn: $settings.captureSystemAudio)
             }
             .disabled(app.recording.isBusy)
+            Section {
+                LabeledContent("マイクの感度") {
+                    HStack {
+                        Slider(value: $settings.microphoneGain, in: AppSettings.microphoneGainRange, step: 1)
+                            .frame(width: 220)
+                        Text("\(Int((Double(settings.microphoneGainFactor) * 100).rounded()))%")
+                            .monospacedDigit()
+                            .frame(width: 52, alignment: .trailing)
+                    }
+                }
+                if app.recording.phase == .recording, settings.captureMicrophone {
+                    LabeledContent("現在の入力レベル") {
+                        LevelMeter(symbol: "mic.fill", level: app.recording.micLevel)
+                    }
+                }
+            } footer: {
+                Text("マイクの音を大きくしてから録音・文字起こしします。声が小さくて文字起こしされないときに上げてください。録音中も変更でき、すぐ反映されます。周囲の雑音も一緒に大きくなるので、上げすぎると物音を拾いやすくなります。システム音声(相手の声)には影響しません。")
+            }
         }
         .formStyle(.grouped)
     }

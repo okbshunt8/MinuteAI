@@ -19,6 +19,14 @@ final class AudioRecorder {
     private var micQueue: [Float] = []
     private var systemQueue: [Float] = []
     private var useMic = false
+    /// Guarded by `lock`.
+    private var micGain: Float = 1
+
+    /// Factor the microphone is amplified by; can be changed while recording.
+    var microphoneGain: Float {
+        get { lock.withLock { micGain } }
+        set { lock.withLock { micGain = newValue } }
+    }
     private var useSystem = false
 
     private let mixQueue = DispatchQueue(label: "minuteai.mixer")
@@ -75,7 +83,13 @@ final class AudioRecorder {
                 microphone.onSamples = { [weak self] samples in
                     guard let self else { return }
                     self.lock.lock()
-                    self.micQueue.append(contentsOf: samples)
+                    if self.micGain == 1 {
+                        self.micQueue.append(contentsOf: samples)
+                    } else {
+                        // Louder than full scale is clipped when the two sources are mixed.
+                        let gain = self.micGain
+                        self.micQueue.append(contentsOf: samples.map { $0 * gain })
+                    }
                     self.lock.unlock()
                 }
                 try microphone.start()

@@ -95,6 +95,7 @@ final class RecordingController {
                 Task { @MainActor in self?.warn(message) }
             }
             try FileManager.default.createDirectory(at: MeetingStore.folder(for: id), withIntermediateDirectories: true)
+            recorder.microphoneGain = settings.microphoneGainFactor
             try recorder.start(
                 to: MeetingStore.audioURL(for: id),
                 microphone: settings.captureMicrophone, systemAudio: settings.captureSystemAudio)
@@ -108,6 +109,8 @@ final class RecordingController {
                 Task { @MainActor in
                     guard let self, self.phase == .recording else { return }
                     self.elapsed = self.recorder.duration
+                    // Follows the slider in the settings, so it can be tuned while watching the level meter.
+                    self.recorder.microphoneGain = self.settings.microphoneGainFactor
                 }
             }
         } catch {
